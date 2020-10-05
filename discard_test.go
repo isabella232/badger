@@ -57,15 +57,16 @@ func TestFirstVlogFile(t *testing.T) {
 
 	opt := DefaultOptions(dir).WithValueThreshold(0)
 	db, err := Open(opt)
+	defer db.Close()
 	require.NoError(t, err)
 	ds := db.vlog.discardStats
-	require.Equal(t, 0, ds.nextEmptySlot)
+	require.Zero(t, ds.nextEmptySlot)
 	fid, _ := ds.MaxDiscard()
-	require.Equal(t, uint32(0), fid)
+	require.Zero(t, fid)
 
 	db.vlog.createVlogFile()
 	fids := db.vlog.sortedFids()
-	require.NotEqual(t, len(fids), 0)
+	require.NotZero(t, len(fids))
 	require.Equal(t, uint32(1), fids[0])
 }
 
@@ -88,6 +89,6 @@ func TestReloadDiscardStats(t *testing.T) {
 	db2, err := Open(opt)
 	require.NoError(t, err)
 	ds2 := db2.vlog.discardStats
-	require.Equal(t, 0, int(ds2.Update(uint32(1), 0)))
+	require.Zero(t, ds2.Update(uint32(1), 0))
 	require.Equal(t, 1, int(ds2.Update(uint32(2), 0)))
 }

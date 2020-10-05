@@ -851,7 +851,6 @@ func (vlog *valueLog) write(reqs []*request) error {
 			if err != nil {
 				return err
 			}
-			// TODO(Naman): Add a test for this.
 			// Reset the meta.
 			e.meta = meta
 			p.Len = uint32(plen)
