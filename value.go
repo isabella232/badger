@@ -970,7 +970,6 @@ func (vlog *valueLog) pickLog(discardRatio float64) *logFile {
 	defer vlog.filesLock.RUnlock()
 
 LOOP:
-	// TODO(naman): Add a test for MaxDiscard which checks for the zero value.
 	// Pick a candidate that contains the largest amount of discardable data
 	fid, discard := vlog.discardStats.MaxDiscard()
 
