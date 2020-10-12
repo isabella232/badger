@@ -18,10 +18,13 @@ package badger
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/dgraph-io/badger/v2/table"
 	"github.com/dgraph-io/badger/v2/y"
@@ -198,4 +201,296 @@ func (cs *compactStatus) delete(cd compactDef) {
 		fmt.Printf("Next Level:\n%s\n", nextLevel.debug())
 		log.Fatal("keyRange not found")
 	}
+}
+
+func (s *levelsController) runCompactDef(l int, cd compactDef) (err error) {
+	timeStart := time.Now()
+
+	thisLevel := cd.thisLevel
+	nextLevel := cd.nextLevel
+
+	// Table should never be moved directly between levels, always be rewritten to allow discarding
+	// invalid versions.
+
+	newTables, decr, err := s.compactBuildTables(l, cd)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Only assign to err, if it's not already nil.
+		if decErr := decr(); err == nil {
+			err = decErr
+		}
+	}()
+	changeSet := buildChangeSet(&cd, newTables)
+
+	// We write to the manifest _before_ we delete files (and after we created files)
+	if err := s.kv.manifest.addChanges(changeSet.Changes); err != nil {
+		return err
+	}
+
+	// See comment earlier in this function about the ordering of these ops, and the order in which
+	// we access levels when reading.
+	if err := nextLevel.replaceTables(cd.bot, newTables); err != nil {
+		return err
+	}
+	if err := thisLevel.deleteTables(cd.top); err != nil {
+		return err
+	}
+
+	// Note: For level 0, while doCompact is running, it is possible that new tables are added.
+	// However, the tables are added only to the end, so it is ok to just delete the first table.
+
+	if dur := time.Since(timeStart); dur > 3*time.Second {
+		s.kv.opt.Infof("LOG Compact %d->%d, del %d tables, add %d tables, took %v\n",
+			thisLevel.level, nextLevel.level, len(cd.top)+len(cd.bot),
+			len(newTables), dur)
+	}
+
+	if cd.thisLevel.level != 0 && len(newTables) > 2*s.kv.opt.LevelSizeMultiplier {
+		s.kv.opt.Infof("This Range (numTables: %d)\nLeft:\n%s\nRight:\n%s\n",
+			len(cd.top), hex.Dump(cd.thisRange.left), hex.Dump(cd.thisRange.right))
+		s.kv.opt.Infof("Next Range (numTables: %d)\nLeft:\n%s\nRight:\n%s\n",
+			len(cd.bot), hex.Dump(cd.nextRange.left), hex.Dump(cd.nextRange.right))
+	}
+	return nil
+}
+
+// compactBuildTables merges topTables and botTables to form a list of new tables.
+func (s *levelsController) compactBuildTables(
+	lev int, cd compactDef) ([]*table.Table, func() error, error) {
+	topTables := cd.top
+	botTables := cd.bot
+
+	numTables := int64(len(topTables) + len(botTables))
+	y.NumCompactionTables.Add(numTables)
+	defer y.NumCompactionTables.Add(-numTables)
+
+	// Check overlap of the top level with the levels which are not being
+	// compacted in this compaction.
+	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1)
+
+	// Try to collect stats so that we can inform value log about GC. That would help us find which
+	// value log file should be GCed.
+	discardStats := make(map[uint32]int64)
+	updateStats := func(vs y.ValueStruct) {
+		// We don't need to store/update discard stats when badger is running in Disk-less mode.
+		if s.kv.opt.InMemory {
+			return
+		}
+		if vs.Meta&bitValuePointer > 0 {
+			var vp valuePointer
+			vp.Decode(vs.Value)
+			discardStats[vp.Fid] += int64(vp.Len)
+		}
+	}
+
+	// Create iterators across all the tables involved first.
+	var iters []y.Iterator
+	switch {
+	case lev == 0:
+		iters = appendIteratorsReversed(iters, topTables, table.NOCACHE)
+	case len(topTables) > 0:
+		y.AssertTrue(len(topTables) == 1)
+		iters = []y.Iterator{topTables[0].NewIterator(table.NOCACHE)}
+	}
+
+	// Next level has level>=1 and we can use ConcatIterator as key ranges do not overlap.
+	var valid []*table.Table
+
+nextTable:
+	for _, table := range botTables {
+		if len(cd.dropPrefixes) > 0 {
+			for _, prefix := range cd.dropPrefixes {
+				if bytes.HasPrefix(table.Smallest(), prefix) &&
+					bytes.HasPrefix(table.Biggest(), prefix) {
+					// All the keys in this table have the dropPrefix. So, this
+					// table does not need to be in the iterator and can be
+					// dropped immediately.
+					continue nextTable
+				}
+			}
+		}
+		valid = append(valid, table)
+	}
+	iters = append(iters, table.NewConcatIterator(valid, table.NOCACHE))
+	it := table.NewMergeIterator(iters, false)
+	defer it.Close() // Important to close the iterator to do ref counting.
+
+	it.Rewind()
+
+	// Pick a discard ts, so we can discard versions below this ts. We should
+	// never discard any versions starting from above this timestamp, because
+	// that would affect the snapshot view guarantee provided by transactions.
+	discardTs := s.kv.orc.discardAtOrBelow()
+
+	var numBuilds, numVersions int
+	var lastKey, skipKey []byte
+	var vp valuePointer
+	var newTables []*table.Table
+	mu := new(sync.Mutex) // Guards newTables
+
+	inflightBuilders := y.NewThrottle(5)
+	for it.Valid() {
+		timeStart := time.Now()
+		dk, err := s.kv.registry.latestDataKey()
+		if err != nil {
+			return nil, nil,
+				y.Wrapf(err, "Error while retrieving datakey in levelsController.compactBuildTables")
+		}
+		bopts := buildTableOptions(s.kv.opt)
+		bopts.DataKey = dk
+		// Builder does not need cache but the same options are used for opening table.
+		bopts.BlockCache = s.kv.blockCache
+		bopts.IndexCache = s.kv.indexCache
+		builder := table.NewTableBuilder(bopts)
+		var numKeys, numSkips uint64
+		for ; it.Valid(); it.Next() {
+			// See if we need to skip the prefix.
+			if len(cd.dropPrefixes) > 0 && hasAnyPrefixes(it.Key(), cd.dropPrefixes) {
+				numSkips++
+				updateStats(it.Value())
+				continue
+			}
+
+			// See if we need to skip this key.
+			if len(skipKey) > 0 {
+				if y.SameKey(it.Key(), skipKey) {
+					numSkips++
+					updateStats(it.Value())
+					continue
+				} else {
+					skipKey = skipKey[:0]
+				}
+			}
+
+			if !y.SameKey(it.Key(), lastKey) {
+				if builder.ReachedCapacity(uint64(float64(s.kv.opt.MaxTableSize) * 0.9)) {
+					// Only break if we are on a different key, and have reached capacity. We want
+					// to ensure that all versions of the key are stored in the same sstable, and
+					// not divided across multiple tables at the same level.
+					break
+				}
+				lastKey = y.SafeCopy(lastKey, it.Key())
+				numVersions = 0
+			}
+
+			vs := it.Value()
+			version := y.ParseTs(it.Key())
+			// Do not discard entries inserted by merge operator. These entries will be
+			// discarded once they're merged
+			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {
+				// Keep track of the number of versions encountered for this key. Only consider the
+				// versions which are below the minReadTs, otherwise, we might end up discarding the
+				// only valid version for a running transaction.
+				numVersions++
+
+				// Keep the current version and discard all the next versions if
+				// - The `discardEarlierVersions` bit is set OR
+				// - We've already processed `NumVersionsToKeep` number of versions
+				// (including the current item being processed)
+				lastValidVersion := vs.Meta&bitDiscardEarlierVersions > 0 ||
+					numVersions == s.kv.opt.NumVersionsToKeep
+
+				isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
+
+				if isExpired || lastValidVersion {
+					// If this version of the key is deleted or expired, skip all the rest of the
+					// versions. Ensure that we're only removing versions below readTs.
+					skipKey = y.SafeCopy(skipKey, it.Key())
+
+					switch {
+					// Add the key to the table only if it has not expired.
+					// We don't want to add the deleted/expired keys.
+					case !isExpired && lastValidVersion:
+						// Add this key. We have set skipKey, so the following key versions
+						// would be skipped.
+					case hasOverlap:
+						// If this key range has overlap with lower levels, then keep the deletion
+						// marker with the latest version, discarding the rest. We have set skipKey,
+						// so the following key versions would be skipped.
+					default:
+						// If no overlap, we can skip all the versions, by continuing here.
+						numSkips++
+						updateStats(vs)
+						continue // Skip adding this key.
+					}
+				}
+			}
+			numKeys++
+			if vs.Meta&bitValuePointer > 0 {
+				vp.Decode(vs.Value)
+			}
+			builder.Add(it.Key(), vs, vp.Len)
+		}
+		// It was true that it.Valid() at least once in the loop above, which means we
+		// called Add() at least once, and builder is not Empty().
+		s.kv.opt.Debugf("LOG Compact. Added %d keys. Skipped %d keys. Iteration took: %v",
+			numKeys, numSkips, time.Since(timeStart))
+		if builder.Empty() {
+			// Cleanup builder resources:
+			builder.Finish(false)
+			builder.Close()
+			continue
+		}
+		numBuilds++
+		fileID := s.reserveFileID()
+		if err := inflightBuilders.Do(); err != nil {
+			// Can't return from here, until I decrRef all the tables that I built so far.
+			break
+		}
+		go func(builder *table.Builder) {
+			defer builder.Close()
+			defer inflightBuilders.Done(err)
+
+			build := func(fileID uint64) (*table.Table, error) {
+				fname := table.NewFilename(fileID, s.kv.opt.Dir)
+				return table.CreateTable(fname, builder.Finish(false), bopts)
+			}
+
+			var tbl *table.Table
+			var err error
+			if s.kv.opt.InMemory {
+				tbl, err = table.OpenInMemoryTable(builder.Finish(true), fileID, &bopts)
+			} else {
+				tbl, err = build(fileID)
+			}
+
+			// If we couldn't build the table, return fast.
+			if err != nil {
+				return
+			}
+
+			mu.Lock()
+			newTables = append(newTables, tbl)
+			// num := atomic.LoadInt32(&table.NumBlocks)
+			mu.Unlock()
+
+			// TODO(ibrahim): When ristretto PR #186 merges, bring this back.
+			// s.kv.opt.Debugf("Num Blocks: %d. Num Allocs (MB): %.2f\n", num, (z.NumAllocBytes() / 1 << 20))
+		}(builder)
+	}
+
+	// Wait for all table builders to finish and also for newTables accumulator to finish.
+	err := inflightBuilders.Finish()
+	if err == nil {
+		// Ensure created files' directory entries are visible.  We don't mind the extra latency
+		// from not doing this ASAP after all file creation has finished because this is a
+		// background operation.
+		err = s.kv.syncDir(s.kv.opt.Dir)
+	}
+
+	if err != nil {
+		// An error happened.  Delete all the newly created table files (by calling DecrRef
+		// -- we're the only holders of a ref).
+		_ = decrRefs(newTables)
+		return nil, nil, y.Wrapf(err, "while running compactions for: %+v", cd)
+	}
+
+	sort.Slice(newTables, func(i, j int) bool {
+		return y.CompareKeys(newTables[i].Biggest(), newTables[j].Biggest()) < 0
+	})
+	s.kv.vlog.updateDiscardStats(discardStats)
+	s.kv.opt.Debugf("Discard stats: %v", discardStats)
+	return newTables, func() error { return decrRefs(newTables) }, nil
 }
